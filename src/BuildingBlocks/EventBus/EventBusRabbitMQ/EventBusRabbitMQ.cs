@@ -2,6 +2,7 @@
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBus;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBus.Abstractions;
 using Microsoft.eShopOnContainers.BuildingBlocks.EventBus.Events;
+using Microsoft.eShopOnContainers.BuildingBlocks.EventBus.Extensions;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -76,7 +77,7 @@ namespace Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ
                 .Or<SocketException>()
                 .WaitAndRetry(_retryCount, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)), (ex, time) =>
                 {
-                    _logger.LogWarning(ex.ToString());
+                    _logger.LogWarning(ex, "Could not publish event: {EventId} after {Timeout}s ({ExceptionMessage})", @event.Id, $"{time.TotalSeconds:n1}", ex.Message);
                 });
 
             using (var channel = _persistentConnection.CreateModel())
@@ -92,9 +93,13 @@ namespace Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ
 
                 policy.Execute(() =>
                 {
+                    var properties = channel.CreateBasicProperties();
+                    properties.DeliveryMode = 2; // persistent
+
                     channel.BasicPublish(exchange: BROKER_NAME,
                                      routingKey: eventName,
-                                     basicProperties: null,
+                                     mandatory: true,
+                                     basicProperties: properties,
                                      body: body);
                 });
             }
@@ -103,8 +108,11 @@ namespace Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ
         public void SubscribeDynamic<TH>(string eventName)
             where TH : IDynamicIntegrationEventHandler
         {
+            _logger.LogInformation("Subscribing to dynamic event {EventName} with {EventHandler}", eventName, typeof(TH).GetGenericTypeName());
+
             DoInternalSubscription(eventName);
             _subsManager.AddDynamicSubscription<TH>(eventName);
+            StartBasicConsume();
         }
 
         public void Subscribe<T, TH>()
@@ -113,7 +121,11 @@ namespace Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ
         {
             var eventName = _subsManager.GetEventKey<T>();
             DoInternalSubscription(eventName);
+
+            _logger.LogInformation("Subscribing to event {EventName} with {EventHandler}", eventName, typeof(TH).GetGenericTypeName());
+
             _subsManager.AddSubscription<T, TH>();
+            StartBasicConsume();
         }
 
         private void DoInternalSubscription(string eventName)
@@ -136,9 +148,13 @@ namespace Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ
         }
 
         public void Unsubscribe<T, TH>()
-            where TH : IIntegrationEventHandler<T>
             where T : IntegrationEvent
+            where TH : IIntegrationEventHandler<T>
         {
+            var eventName = _subsManager.GetEventKey<T>();
+
+            _logger.LogInformation("Unsubscribing from event {EventName}", eventName);
+
             _subsManager.RemoveSubscription<T, TH>();
         }
 
@@ -156,6 +172,31 @@ namespace Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ
             }
 
             _subsManager.Clear();
+        }
+
+        private void StartBasicConsume()
+        {
+            if (_consumerChannel != null)
+            {
+                var consumer = new EventingBasicConsumer(_consumerChannel);
+                consumer.Received += async (model, ea) =>
+                {
+                    var eventName = ea.RoutingKey;
+                    var message = Encoding.UTF8.GetString(ea.Body);
+
+                    await ProcessEvent(eventName, message);
+
+                    _consumerChannel.BasicAck(ea.DeliveryTag, multiple: false);
+                };
+
+                _consumerChannel.BasicConsume(queue: _queueName,
+                                     autoAck: false,
+                                     consumer: consumer);
+            }
+            else
+            {
+                _logger.LogError("StartBasicConsume can not call on _consumerChannelCreated == false");
+            }
         }
 
         private IModel CreateConsumerChannel()
@@ -176,24 +217,11 @@ namespace Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ
                                  autoDelete: false,
                                  arguments: null);
 
-
-            var consumer = new EventingBasicConsumer(channel);
-            consumer.Received += async (model, ea) =>
-            {
-                var eventName = ea.RoutingKey;
-                var message = Encoding.UTF8.GetString(ea.Body);
-
-                await ProcessEvent(eventName, message);
-            };
-
-            channel.BasicConsume(queue: _queueName,
-                                 autoAck: false,
-                                 consumer: consumer);
-
             channel.CallbackException += (sender, ea) =>
             {
                 _consumerChannel.Dispose();
                 _consumerChannel = CreateConsumerChannel();
+                StartBasicConsume();
             };
 
             return channel;
@@ -209,16 +237,18 @@ namespace Microsoft.eShopOnContainers.BuildingBlocks.EventBusRabbitMQ
                     foreach (var subscription in subscriptions)
                     {
                         if (subscription.IsDynamic)
-                        { 
+                        {
                             var handler = scope.ResolveOptional(subscription.HandlerType) as IDynamicIntegrationEventHandler;
+                            if (handler == null) continue;
                             dynamic eventData = JObject.Parse(message);
                             await handler.Handle(eventData);
                         }
                         else
                         {
+                            var handler = scope.ResolveOptional(subscription.HandlerType);
+                            if (handler == null) continue;
                             var eventType = _subsManager.GetEventTypeByName(eventName);
                             var integrationEvent = JsonConvert.DeserializeObject(message, eventType);
-                            var handler = scope.ResolveOptional(subscription.HandlerType);
                             var concreteType = typeof(IIntegrationEventHandler<>).MakeGenericType(eventType);
                             await (Task)concreteType.GetMethod("Handle").Invoke(handler, new object[] { integrationEvent });
                         }
